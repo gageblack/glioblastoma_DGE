@@ -1,0 +1,253 @@
+---
+title: "Glioblastoma DGE Analysis"
+author: "Gage Black"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document.
+
+## Downloading GBM Data
+This analysis is done using the count data from the TCGA, Cell 2013 project.
+ * Clinical data downloaded from: https://www.cbioportal.org/study/clinicalData?id=gbm_tcga_pub2013
+ * Gene count files and sample sheet were downloaded from the DGC Data Portal: https://portal.gdc.cancer.gov/repository?filters=%7B%22op%22%3A%22and%22%2C%22content%22%3A%5B%7B%22content%22%3A%7B%22field%22%3A%22cases.case_id%22%2C%22value%22%3A%5B%22set_id%3Afz3ffYUBwT6ZqKJs2D9f%22%5D%7D%2C%22op%22%3A%22IN%22%7D%2C%7B%22op%22%3A%22in%22%2C%22content%22%3A%7B%22field%22%3A%22files.access%22%2C%22value%22%3A%5B%22open%22%5D%7D%7D%2C%7B%22op%22%3A%22in%22%2C%22content%22%3A%7B%22field%22%3A%22files.data_category%22%2C%22value%22%3A%5B%22transcriptome%20profiling%22%5D%7D%7D%2C%7B%22op%22%3A%22in%22%2C%22content%22%3A%7B%22field%22%3A%22files.experimental_strategy%22%2C%22value%22%3A%5B%22RNA-Seq%22%5D%7D%7D%5D%7D
+    + This link will take you to the files that were downloaded. Add all to cart, click on the cart, and download files. 
+    + This is also where the sample sheet can be downloaded.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(data.table)
+setwd("~/Desktop/Glioblastoma") ## Edit this to be whatever directory you are working in.
+```
+
+## Date Processing
+* Read in the clinical data that was downloaded from cBioPortal (). Filter it to only include samples that are IDH1 WT and have a methylation status listed. Then select the rows of data that you want to keep.
+* Next, read in the sample sheet that was downloaded from TCGA.
+* The count data is then read in from each file, adding the count data for all samples into one final count matrix (mrna_counts)
+* The Meta data is created using the clincal data.
+* 3 samples are filtered out because of lower correlation to the rest of the samples.
+* At the end of this section, the count matrix, metadata, and a map for the gene names is saved and ready to use for the DESeq2 analysis.
+
+```{r data_setup}
+## Read the clinical data from TCGA_Cell
+clinical_data <- read_tsv("gbm_tcga_pub2013_clinical_data.tsv")
+
+## Filter clinical data to only include samples that are IDH1 WT, and have a methylation status listed. Select desired columns to keep.
+clinical_data = filter(clinical_data, `IDH1 Mutation` == 'WT')
+clinical_data = filter(clinical_data, `MGMT Status` == 'METHYLATED' | `MGMT Status` == 'UNMETHYLATED')
+clinical_data = select(clinical_data, -c("Mutation Count", "Fraction Genome Altered", "G-CIMP  Methylation", "Gene Expression Subtype", "IDH1 Mutation", "Methylation Status" ))
+
+## Read in the sample sheet and filter the clinical data to only include samples found in the sample sheet.
+sample_sheet = read_tsv("gdc_sample_sheet.2023-01-06.tsv")
+clinical_data = filter(clinical_data, (`Patient ID` %in% sample_sheet$`Case ID`))
+
+## A function that reads in the raw counts from each sample directory, creating a single data.table
+generate_count_mat <- function(path, pattern, protein_coding_only=TRUE){
+  files = list.files(path, pattern, full.names = TRUE, recursive = TRUE, include.dirs=TRUE)
+  count_matrix = as.data.frame(do.call(cbind, lapply(files, function(x) fread(x, stringsAsFactors = FALSE))))
+  count_matrix = count_matrix[-c(1:4),]
+  gene_name_map <<- count_matrix[,c(1:2)] ## The <<- makes gene_name_map a global variable.
+  if(protein_coding_only == TRUE){
+    rownames(count_matrix) = count_matrix[,1]
+    count_matrix = as.data.frame(count_matrix[, seq(4, ncol(count_matrix), 9)])
+  }
+  else{
+    rownames(count_matrix) = count_matrix[,1]
+    count_matrix = as.data.frame(count_matrix[, seq(4, ncol(count_matrix), 9)])
+  }
+  return(count_matrix)
+}
+## Create the count matrix using the function 
+mrna_counts <- generate_count_mat("gdc_download_20230107_032813.297505", "\\.rna_seq.augmented_star_gene_counts.tsv$", FALSE)
+
+## Add the file names as column names, then match the sample ID to the file name and set column names to the sample ID. 
+files <- list.files("gdc_download_20230107_032813.297505", "\\.rna_seq.augmented_star_gene_counts.tsv$", full.names = FALSE, recursive = TRUE, include.dirs = FALSE)
+file_names = sub(".*/", "", files)
+sample_sheet = sample_sheet[match(file_names, sample_sheet$`File Name`),]
+colnames(mrna_counts) <- sample_sheet$`Case ID`
+
+## Create the metadata object needed for DESeq.
+meta <- select(clinical_data, c(`Patient ID`, 'MGMT Status'))
+mrna_counts <- select(mrna_counts, meta$`Patient ID`)
+rownames(meta) <- NULL
+meta <- column_to_rownames(meta, var = "Patient ID")
+colnames(meta) = "MGMT"
+meta$MGMT <- as.factor(meta$MGMT)
+levels(meta$MGMT)
+
+## Filter out samples ##
+drop = c("TCGA-06-2569", "TCGA-14-0871", "TCGA-28-5218")
+mrna_counts <- select(mrna_counts, !drop)
+meta <- filter(meta, !rownames(meta) %in% drop)
+
+## Save the count matrix, meta data, and gene name map to an RData object for easy loading.
+save(mrna_counts, meta, gene_name_map, file = "DEseq_input.RData")
+#load("DEseq_input.RData") ## This can be used to load the data.
+```
+
+## DESeq2 Analysis
+* Creates the DESeq object that is used by the package and do the pre-filtering recommended by DESeq2.
+* Creates a heatmap showing the pairwise correlation of the samples to look for outliers. 
+* Perform the differential expression analysis using the DESeq2 package and extract the results.. 
+* Row names are converted to the gene symbol and 
+* Save the count matrix, meta data, and gene name map to an RData object for easy loading.
+* Create plots for the results.
+
+```{r deseq2}
+library(DESeq2)
+library(pheatmap)
+
+## Create the DESeq object.
+dds <- DESeqDataSetFromMatrix(mrna_counts, colData = meta, design = ~ MGMT)
+
+## Minimal prefiltering
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+dds$MGMT <- relevel(dds$MGMT, ref = "UNMETHYLATED")
+
+## Create heatmap for QC ##
+dds <- estimateSizeFactors(dds)
+vsd <- vst(dds, blind=T) ## normalize with VST
+vsd_mat <- assay(vsd) ## Extract matrix
+vsd_cor <- cor(vsd_mat) ## Compute pairwise correlation values
+pheatmap(vsd_cor)
+
+## Apply the DESeq function and retrieve the results.
+dds = DESeq(dds)
+res <- results(dds, alpha = 0.05, name = "MGMT_METHYLATED_vs_UNMETHYLATED")
+rownames(res) <- gene_name_map$gene_name[match(rownames(res), gene_name_map$gene_id)]
+
+## Save the resutling DESeq object and the extracted results to an RData object.
+save(dds, res, file = "DESeq_results.RData")
+load("DESeq_results.RData")
+
+## Explore the results and reorder them based on the adjusted p value.
+summary(res)
+resOrdered <- res[order(res$padj),]
+head(resOrdered)
+
+## Make a dataframe of the results and extract the upregulated and downregulated genes.
+res_df <- as.data.frame(res)
+upreg_key <- intersect(rownames(res_df)[which(res_df$log2FoldChange>=1)], rownames(res_df)[which(res_df$padj<=0.05)]) 
+downreg_key <- intersect(rownames(res_df)[which(res_df$log2FoldChange<=-1)], rownames(res_df)[which(res_df$padj<=0.05)]) 
+upreg_results <- as.data.frame((res_df)[which(rownames(res_df) %in% upreg_key),])
+downreg_results <- as.data.frame((res_df)[which(rownames(res_df) %in% downreg_key),])
+
+## Write results and genes to a file.
+write.csv(upreg_key, "upreg_gene_names.csv")
+write.csv(downreg_key, "downreg_gene_names.csv")
+write.csv(upreg_results, "upreg_results.csv")
+write.csv(downreg_results, "downreg_results.csv")
+```
+Create plots that help visualize the DESeq output
+```{r plot_DE}
+
+## Create an MA plot, dispersion estimates plot, and a histogram of the adjusted p values. These can be saved using the commented lines.
+#pdf("MA_plot.pdf")
+plotMA(res, ylim= c(-2,2), alpha = 0.05) ## Plots the log2-fold change (y-axis) of the mean expression level (x-axis) for each gene between the two conditions.
+#dev.off()
+plotDispEsts(dds, ylim = c(1e-6, 1e1)) ## Plots the dispersion of the expression levels for each gene across all samples in each condition.
+hist(res$padj) ## Histogram of the adjusted p-values.
+
+```
+
+## Functional Analysis
+* The grch37 object from annotables is used to annotate our genes and get the ENTREZ IDs.
+* A table is created from the results using grch37 annotations, and any gene name duplicates are removed
+* The background and test ste are created. The background are all genes from all samples, while the test set are the differentially expressed genes.
+* The functional enrichment analysis is performed, using The Gene Consortium's Gene Ontology. The ontologies that can be used are:
++ "BP" = Biological Process
++ "MF" = Molecular Function
++ "CC" = Cellular Component
++ "ALL"
+* Results are assigned to the cluster_summary object and saved to a csv file.
+```{r functional_analysis}
+#BiocManager::install("clusterProfiler")
+#devtools::install_github("stephenturner/annotables")
+
+library(clusterProfiler)
+library(annotables)
+library(org.Hs.eg.db)
+
+## Get the IDs for the gene symbols
+idx <- grch37$symbol %in% rownames(res)
+ids <- grch37[idx,]
+
+## Remove duplicate genes ##
+non_duplicates <- which(duplicated(ids$symbol) == FALSE)
+ids <- ids[non_duplicates,]
+
+# res_tb = as_tibble(rownames_to_column(data.frame(res), var = "gene")) ## Equivalent to function below)
+res_tb = res %>%
+  data.frame() %>%
+  rownames_to_column(var = "gene") %>%
+  as_tibble()
+
+res_ids <- inner_join(res_tb, ids, by=c("gene"="symbol"))
+
+## Create background dataset and significant results to seperate DFs.
+allOE_gene <- as.character(res_ids$ensgene) ## background dataset
+sigOE <- filter(res_ids, padj < 0.05)
+sigOE_gene <- as.character(sigOE$ensgene)
+
+## Perform GO enrichment analysis. ont can be "BP", "MF", or "CC"
+ego <- enrichGO(gene = sigOE_gene,
+                universe = allOE_gene,
+                keyType = "ENSEMBL",
+                OrgDb = org.Hs.eg.db,
+                ont = "BP",
+                pAdjustMethod = "BH",
+                qvalueCutoff = 0.05,
+                readable = TRUE)
+
+cluster_summary <- data.frame(ego)    
+write.csv(cluster_summary, "functional_enrichment_results.csv")
+```
+Create plots to visualize the results of the functional enrichment analysis. cnet plots can be saved by uncommenting the lines below.
+```{r plot_FE}
+dotplot(ego, showCategory=25, font.size = 5)
+
+OE_foldchanges <-sigOE$log2FoldChange
+names(OE_foldchanges) <- sigOE_gene
+
+#pdf("cnetplot.pdf", width = 10)
+cnetplot(ego, category="pvalue", showCategory = 5, foldChange = OE_foldchanges)
+cnetplot(ego, foldChange=OE_foldchanges, circular = TRUE, colorEdge = TRUE)
+#dev.off()
+```
+
+## Gene Set Enrichment Analysis
+* Extract the fold changes and perform the GSEA. Uses the KEGG database (https://www.genome.jp/kegg/pathway.html).
+* Results are saved to a csv file.
+* A plot visualizes the results for a the Glioma gene set. 
++ Other gene sets can be specified using the code found on the KEGG link above.
+```{r gsea} 
+## Extract Entrez IDs, made a list of fold changes, and sorted them in decreasing order.
+res_entrez  <- filter(res_ids, entrez != "NA")
+res_entrez <- res_entrez[which(duplicated(res_entrez$entrez) == F), ]
+foldchanges <- res_entrez$log2FoldChange
+names(foldchanges) <- res_entrez$entrez
+foldchanges <- sort(foldchanges, decreasing = TRUE)
+
+## Perform the GSEA ##
+gseaKEGG <- gseKEGG(geneList = foldchanges,
+                    organism = "hsa",
+                    pvalueCutoff = 0.05)
+
+gseaKEGG_results <- gseaKEGG@result
+write.csv(gseaKEGG_results, "gsea_results.csv")
+gseaplot(gseaKEGG, geneSetID = 'hsa05214')
+```
+
+
+
+
+
+
+
+
+
+
+
+
